@@ -26,12 +26,16 @@ def fit(X, y, lam):
     w: array of floats: dim = (13,), optimal parameters of ridge regression
     """
     weights = np.zeros((13,))
-    # TODO: Enter your code here
+    
+
+    
+
+
     assert weights.shape == (13,)
     return weights
 
 
-def calculate_RMSE(w, X, y):
+def calculate_RMSE(w: np.ndarray, X: np.ndarray, y: np.ndarray) -> float:
     """This function takes test data points (X and y), and computes the empirical RMSE of 
     predicting y from X using a linear model with weights w. 
 
@@ -45,9 +49,7 @@ def calculate_RMSE(w, X, y):
     ----------
     rmse: float: dim = 1, RMSE value
     """
-    rmse = 0
-    # TODO: Enter your code here
-    assert np.isscalar(rmse)
+    rmse = float(np.sqrt(np.mean((y - X @ w) ** 2)))
     return rmse
 
 
