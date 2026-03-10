@@ -38,9 +38,11 @@ You are free to use either jupyter notebook or the .py template file.
 
 Each line in train.csv represents one datapoint by its label y, and its features x1 to x13:
 
+```csv
 y,x1,x2,x3,x4,x5,x6,x7,x8,x9,x10,x11,x12,x13
 22.6,0.06724,0.0,3.24,0.0,0.46,6.333,17.2,5.2146,4.0,430.0,16.9,375.21,7.34
 ...
+```
 
 For your convenience, we further provide a sample submission file:
 
