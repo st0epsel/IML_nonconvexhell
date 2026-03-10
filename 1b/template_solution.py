@@ -26,7 +26,19 @@ def transform_features(X):
     ----------
     X_transformed: matrix of floats: dim = (700,21), transformed input with 21 features
     """
-    X_transformed = np.zeros((700, 21))
+    lin = X
+
+    quad = X**2
+
+    exp = np.exp(X)
+
+    cos = np.cos(X)
+
+    const = np.ones((700, 1), dtype=int)
+
+    X_transformed = np.hstack((lin, quad, exp, cos, const))
+
+    print(X_transformed)
     # TODO: Enter your code here
     assert X_transformed.shape == (700, 21)
     return X_transformed
@@ -48,6 +60,21 @@ def fit_logistic_regression(X, y):
     """
     weights = np.zeros((21,))
     X_transformed = transform_features(X)
+
+    learning_rate = 0.1 
+    loops = 5000
+    n_rows = X_transformed.shape[0]
+    
+    for i in range(loops):
+        z = X_transformed @ weights
+        yhat = 1 / (1 + np.exp(-z))
+
+        error = yhat - y
+        gradient = (1 / n_rows) * (X_transformed.T @ error)
+        
+        weights = weights - (learning_rate * gradient)
+
+
     # TODO: Enter your code here
     assert weights.shape == (21,)
     return weights
