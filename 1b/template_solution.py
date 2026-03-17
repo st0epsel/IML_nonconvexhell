@@ -62,22 +62,23 @@ def fit_logistic_regression(X, y):
     weights = np.zeros((21,))
     X_transformed = transform_features(X)
 
-    learning_rate = 0.1 
-    loops = 5000
+    learning_rate = 10e-6                               #2nd submission: 0.05
+    loops = 10e8                                        #2nd submission: 500000
     n_rows = X_transformed.shape[0]
     
-    for i in range(loops):
+    for i in range(int(loops)):
         z = X_transformed @ weights
-        yhat = 1 / (1 + np.exp(-z))
+        yhat = 1 / (1 + np.exp(-z))                     #yhat = prediction
 
-        error = yhat - y
+        error = yhat - y                
         gradient = (1 / n_rows) * (X_transformed.T @ error)
         
         weights = weights - (learning_rate * gradient)
-
+    loss = np.mean(np.logaddexp(0, z) - y * z)
 
     # TODO: Enter your code here
     assert weights.shape == (21,)
+    print (loss)
     return weights
 
 
@@ -96,3 +97,4 @@ if __name__ == "__main__":
     w = fit_logistic_regression(X, y)
     # Save results in the required format
     np.savetxt(base_dir / "results.csv", w, fmt="%.12f")
+
