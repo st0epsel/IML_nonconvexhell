@@ -3,6 +3,87 @@
 # First, we import necessary libraries:
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+
+def model_impute(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Impute missing values column-by-column using linear regression
+    based on the other columns in df.
+    Assumes all columns in df are numeric.
+    """
+    df = df.copy()
+
+    for col in df.columns:
+        if df[col].isna().sum() == 0:
+            continue
+
+        known = df[df[col].notna()].copy()
+        missing = df[df[col].isna()].copy()
+
+        if len(known) == 0 or len(missing) == 0:
+            continue
+
+        X_known = known.drop(columns=[col])
+        y_known = known[col]
+        X_missing = missing.drop(columns=[col])
+
+        # Temporary fallback so the model has complete inputs
+        train_means = X_known.mean()
+        X_known = X_known.fillna(train_means)
+        X_missing = X_missing.fillna(train_means)
+
+        Xk = X_known.values.astype(float)
+        yk = y_known.values.astype(float)
+        Xm = X_missing.values.astype(float)
+
+        # Add bias term
+        Xk = np.hstack([np.ones((Xk.shape[0], 1)), Xk])
+        Xm = np.hstack([np.ones((Xm.shape[0], 1)), Xm])
+
+        # Stable linear regression
+        w = np.linalg.pinv(Xk) @ yk
+
+        preds = Xm @ w
+
+        df.loc[df[col].isna(), col] = preds
+
+    return df
+
+
+def iterative_impute(df: pd.DataFrame, n_passes: int = 3) -> pd.DataFrame:
+    """
+    Repeat model-based imputation multiple times.
+    """
+    df = df.copy()
+    for _ in range(n_passes):
+        df = model_impute(df)
+    return df
+
+
+def seasonal_model_impute(df: pd.DataFrame, n_passes: int = 3) -> pd.DataFrame:
+    """
+    Perform model-based imputation separately within each season.
+    Expects a column named 'season'.
+    """
+    df = df.copy()
+    parts = []
+
+    for season in df["season"].dropna().unique():
+        subset = df[df["season"] == season].copy()
+
+        season_values = subset["season"]
+        numeric_part = subset.drop(columns=["season"])
+
+        numeric_part = iterative_impute(numeric_part, n_passes=n_passes)
+
+        numeric_part["season"] = season_values
+        parts.append(numeric_part)
+
+    df_imputed = pd.concat(parts).sort_index()
+    return df_imputed
+
 
 def load_data():
     """
@@ -39,45 +120,38 @@ def load_data():
     #X_train = np.zeros_like(train_df.drop(['price_CHF'],axis=1))
     #y_train = np.zeros_like(train_df['price_CHF'])
     #X_test = np.zeros_like(test_df)
+    #####################
 
-    y_train_df = train_df["price_CHF"].copy()               #only price_CHF (=target)
-    X_train_df = train_df.drop(columns=["price_CHF"])
+    # idea: look only at X, not y
+    # predict the missing data of the other columns with model imputation
+    # combine with y again and drop all rows with missing values in price_CHF 
+    # -> that way, we can still use this rows for imputation, but don't need to estimate our y.
     
-    X_test_df = test_df.copy()
+    # Model imputation based on seasons
+    #train & test data
+    X_train_imputed = seasonal_model_impute(train_df.drop(columns=["price_CHF"]), n_passes=3)
+    X_test_imputed = seasonal_model_impute(test_df, n_passes=3)
 
-    #to fill missing values, we calculate the mean of a column, depending on the seasons. 
-    # this mean is then filled into the NaN values of the data 
-    # numeric_only=True is used so that it doesb't calculate a mean over the seasons
-    seasonal_means_X = X_train_df.groupby('season').mean(numeric_only=True)
-    seasonal_means_y = train_df.groupby('season')['price_CHF'].mean()
+    # combine again, drop empty rows in y
+    train_combined = X_train_imputed.copy()
+    train_combined["price_CHF"] = train_df["price_CHF"]
+    train_combined = train_combined.dropna(subset=["price_CHF"])
 
-    #loop through each season 
-    for season in seasonal_means_X.index:
-        
-        # true/false mask for the specific season
-        train_mask = X_train_df['season'] == season
-        test_mask = X_test_df['season'] == season
+    # split again
+    X_train_df = train_combined.drop(columns=["price_CHF"])
+    y_train = train_combined["price_CHF"].values.astype(float)
+    X_test_df = X_test_imputed
 
-        # fill in the means 
-        X_train_df.loc[train_mask] = X_train_df.loc[train_mask].fillna(seasonal_means_X.loc[season])
-        X_test_df.loc[test_mask] = X_test_df.loc[test_mask].fillna(seasonal_means_X.loc[season])
-        
-        y_train_df.loc[train_mask] = y_train_df.loc[train_mask].fillna(seasonal_means_y[season])
-
-    #encode season 
-    X_train_df = pd.get_dummies(X_train_df, columns=["season"])  
+    # encode seasons
+    X_train_df = pd.get_dummies(X_train_df, columns=["season"])
     X_test_df = pd.get_dummies(X_test_df, columns=["season"])
 
-    #Make sure train and test have the same dummy columns in the same order
     X_train_df, X_test_df = X_train_df.align(X_test_df, join='left', axis=1, fill_value=0)
 
     # convert to numpy
-    X_train = X_train_df.values.astype(float)  
-    X_test = X_test_df.values.astype(float)      
-    y_train = y_train_df.values.astype(float)
+    X_train = X_train_df.values.astype(float)
+    X_test = X_test_df.values.astype(float)
     
-  
-
     # TODO: Perform data preprocessing, imputation and extract X_train, y_train and X_test
 
     assert (X_train.shape[1] == X_test.shape[1]) and (X_train.shape[0] == y_train.shape[0]) and (X_test.shape[0] == 100), "Invalid data shape"
