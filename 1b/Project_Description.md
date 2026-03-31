@@ -1,4 +1,4 @@
-1. Task description
+# 1. Task description
 
 This task is about logistic regression: given an input vector $x$, your goal is to predict the value of a binary random variable $y$ where the logits of $y$ can be modelled as a linear function of a set of feature transformations, $\phi(x)$. In other words, the labels $Y$ given $X$ can be modelled using a logistic regression model where the inputs are a feature-transformed $X$.
 Data description

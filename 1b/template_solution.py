@@ -3,12 +3,13 @@
 # First, we import necessary libraries:
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 # Add any additional imports here (however, the task is solvable without using 
 # any additional imports)
 # import ...
 
-def transform_features(X):
+def transform_features(X: np.ndarray) -> np.ndarray:
     """
     This function transforms the 5 input features of matrix X (x_i denoting the i-th component in a given row of X)
     into 21 new features phi(X) in the following manner:
@@ -61,36 +62,39 @@ def fit_logistic_regression(X, y):
     weights = np.zeros((21,))
     X_transformed = transform_features(X)
 
-    learning_rate = 0.1 
-    loops = 5000
+    learning_rate = 10e-6                               #2nd submission: 0.05
+    loops = 10e8                                        #2nd submission: 500000
     n_rows = X_transformed.shape[0]
     
-    for i in range(loops):
+    for i in range(int(loops)):
         z = X_transformed @ weights
-        yhat = 1 / (1 + np.exp(-z))
+        yhat = 1 / (1 + np.exp(-z))                     #yhat = prediction
 
-        error = yhat - y
+        error = yhat - y                
         gradient = (1 / n_rows) * (X_transformed.T @ error)
         
         weights = weights - (learning_rate * gradient)
-
+    loss = np.mean(np.logaddexp(0, z) - y * z)
 
     # TODO: Enter your code here
     assert weights.shape == (21,)
+    print (loss)
     return weights
 
 
 # Main function. You don't have to change this
 if __name__ == "__main__":
+    base_dir = Path(__file__).resolve().parent
     # Data loading
-    data = pd.read_csv("train.csv")
+    data = pd.read_csv(base_dir / "data" / "train.csv")
     y = data["y"].to_numpy()
     data = data.drop(columns=["Id", "y"])
     # print a few data samples
-    print(data.head())
+    print("Sample data: \n", data.head())
 
     X = data.to_numpy()
     # The function retrieving optimal LR parameters
     w = fit_logistic_regression(X, y)
     # Save results in the required format
-    np.savetxt("./results.csv", w, fmt="%.12f")
+    np.savetxt(base_dir / "results.csv", w, fmt="%.12f")
+

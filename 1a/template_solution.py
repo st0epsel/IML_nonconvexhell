@@ -4,6 +4,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import KFold
+from pathlib import Path
 
 # Add any additional imports here (however, the task is solvable without using 
 # any additional imports)
@@ -26,10 +27,9 @@ def fit(X, y, lam):
     w: array of floats: dim = (13,), optimal parameters of ridge regression
     """
     weights = np.zeros((13,))
-    
-
-    
-
+    n_features = X.shape[1]
+    # Closed-form ridge solution: (X^T X + lambda I)^(-1) X^T y
+    weights = np.linalg.solve(X.T @ X + lam * np.eye(n_features), X.T @ y)
 
     assert weights.shape == (13,)
     return weights
@@ -73,6 +73,14 @@ def average_LR_RMSE(X, y, lambdas, n_folds):
 
     # TODO: Enter your code here. Hint: Use functions 'fit' and 'calculate_RMSE' with training and test data
     # and fill all entries in the matrix 'RMSE_mat'
+    kf = KFold(n_splits=n_folds)
+    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(X)):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        for lam_idx, lam in enumerate(lambdas):
+            w = fit(X_train, y_train, lam)
+            RMSE_mat[fold_idx, lam_idx] = calculate_RMSE(w, X_test, y_test)
 
     avg_RMSE = np.mean(RMSE_mat, axis=0)
     assert avg_RMSE.shape == (5,)
@@ -81,8 +89,10 @@ def average_LR_RMSE(X, y, lambdas, n_folds):
 
 # Main function. You don't have to change this
 if __name__ == "__main__":
+    base_dir = Path(__file__).resolve().parent
+
     # Data loading
-    data = pd.read_csv("train.csv")
+    data = pd.read_csv(base_dir / "data" / "train.csv")
     y = data["y"].to_numpy()
     data = data.drop(columns="y")
     # print a few data samples
@@ -94,4 +104,4 @@ if __name__ == "__main__":
     n_folds = 10
     avg_RMSE = average_LR_RMSE(X, y, lambdas, n_folds)
     # Save results in the required format
-    np.savetxt("./results.csv", avg_RMSE, fmt="%.12f")
+    np.savetxt(base_dir / "results.csv", avg_RMSE, fmt="%.12f")
