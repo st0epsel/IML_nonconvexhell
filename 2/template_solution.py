@@ -91,7 +91,7 @@ class Model(object):
         self._y_train = None
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray):
-        #TODO: Define the model and fit it using (X_train, y_train)
+        #TODO: Define the model and fit it using (X_train, y_train) 
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import DotProduct, RBF, Matern, RationalQuadratic
         self.model = GaussianProcessRegressor(kernel=Matern())
