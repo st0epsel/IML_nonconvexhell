@@ -6,6 +6,10 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.linear_model import BayesianRidge
+from sklearn.gaussian_process.kernels import RationalQuadratic
 
 def model_impute(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -13,43 +17,17 @@ def model_impute(df: pd.DataFrame) -> pd.DataFrame:
     based on the other columns in df.
     Assumes all columns in df are numeric.
     """
-    df = df.copy()
-
-    for col in df.columns:
-        if df[col].isna().sum() == 0:
-            continue
-
-        known = df[df[col].notna()].copy()
-        missing = df[df[col].isna()].copy()
-
-        if len(known) == 0 or len(missing) == 0:
-            continue
-
-        X_known = known.drop(columns=[col])
-        y_known = known[col]
-        X_missing = missing.drop(columns=[col])
-
-        # Temporary fallback so the model has complete inputs
-        train_means = X_known.mean()
-        X_known = X_known.fillna(train_means)
-        X_missing = X_missing.fillna(train_means)
-
-        Xk = X_known.values.astype(float)
-        yk = y_known.values.astype(float)
-        Xm = X_missing.values.astype(float)
-
-        # Add bias term
-        Xk = np.hstack([np.ones((Xk.shape[0], 1)), Xk])
-        Xm = np.hstack([np.ones((Xm.shape[0], 1)), Xm])
-
-        # Stable linear regression
-        w = np.linalg.pinv(Xk) @ yk
-
-        preds = Xm @ w
-
-        df.loc[df[col].isna(), col] = preds
-
-    return df
+    cols = df.columns
+    idx = df.index
+    
+    imputer = IterativeImputer(
+        estimator=BayesianRidge(), 
+        max_iter=10, 
+        random_state=42
+    )
+    
+    imputed_matrix = imputer.fit_transform(df)
+    return pd.DataFrame(imputed_matrix, columns=cols, index=idx)
 
 
 def iterative_impute(df: pd.DataFrame, n_passes: int = 3) -> pd.DataFrame:
@@ -76,7 +54,7 @@ def seasonal_model_impute(df: pd.DataFrame, n_passes: int = 3) -> pd.DataFrame:
         season_values = subset["season"]
         numeric_part = subset.drop(columns=["season"])
 
-        numeric_part = iterative_impute(numeric_part, n_passes=n_passes)
+        numeric_part = model_impute(numeric_part)
 
         numeric_part["season"] = season_values
         parts.append(numeric_part)
@@ -167,8 +145,13 @@ class Model(object):
     def fit(self, X_train: np.ndarray, y_train: np.ndarray):
         #TODO: Define the model and fit it using (X_train, y_train) 
         from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import DotProduct, RBF, Matern, RationalQuadratic
-        self.model = GaussianProcessRegressor(kernel=Matern())
+        from sklearn.gaussian_process.kernels import DotProduct, RBF, Matern, RationalQuadratic, ConstantKernel
+        self.model = GaussianProcessRegressor(
+            kernel=ConstantKernel(1.0, (1e-3, 1e3)) * RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1),
+            n_restarts_optimizer=5,
+            normalize_y=True,
+            random_state=42
+        )
         self.model.fit(X_train, y_train)
         self._x_train = X_train
         self._y_train = y_train
@@ -184,6 +167,9 @@ class Model(object):
 if __name__ == "__main__":
     # Data loading
     X_train, y_train, X_test = load_data()
+    scaler = StandardScaler() #scalethe input and test dataset
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
     model = Model()
     # Use this function to fit the model
     model.fit(X_train=X_train, y_train=y_train)
