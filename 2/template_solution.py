@@ -14,7 +14,9 @@ from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from sklearn.linear_model import BayesianRidge
 from sklearn.gaussian_process.kernels import RationalQuadratic
-from sklearn.model_selection import KFold, learning_curve
+from sklearn.model_selection import KFold, RepeatedKFold, learning_curve, cross_val_score
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.kernel_ridge import KernelRidge
 import matplotlib.pyplot as plt
 
 
@@ -288,17 +290,12 @@ class Standardizer(object):
         return self.target_scaler.inverse_transform(y_array).ravel()
 
 class Model(object):
-    def __init__(self, kernel, name: str = "Model") -> None:
+    def __init__(self, model, name: str = "Model") -> None:
         super().__init__()
         self.name = name
         self._x_train = None
         self._y_train = None
-        self.model = GaussianProcessRegressor(
-            kernel=kernel,
-            n_restarts_optimizer=5,
-            normalize_y=True,
-            random_state=config.RANDOM_STATE,
-        )
+        self.model = model
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, show_learning_curve: bool = False) -> None:
         self.model.fit(X_train, y_train)
@@ -321,6 +318,8 @@ class Model(object):
         """
         Minimal learning curve using CV train/test R2.
         """
+        # AI generated visualization tool
+
         cv = KFold(n_splits=2, shuffle=True, random_state=config.RANDOM_STATE)
         lc_result = learning_curve(
             estimator=self.model,
@@ -372,8 +371,8 @@ class BayesianModelSelector(object):
         y_train: np.ndarray,
     ) -> None:
         """
-        Performs Bayesan model performance estimation using the
-        log marginal likelihood returned by sklearn's GaussianProcessRegressor
+        Performs model performance estimation for potentially heterogeneous regressors
+        using repeated K-fold CV R2.
         May the best model win!
 
         Args:
@@ -385,21 +384,49 @@ class BayesianModelSelector(object):
         Returns:
             List of relative model performance scores in the same order as the candidate list
         """
-        
-        scores_abs = np.zeros(len(self.candidates))
+        n_candidates = len(self.candidates)
+        scores_abs = np.zeros(n_candidates)
+        score_std = np.zeros(n_candidates)
 
-        # Getting log evidence scores for the candidate models
+        cv = RepeatedKFold(
+            n_splits=config.CV_N_SPLITS,
+            n_repeats=config.CV_N_REPEATS,
+            random_state=config.RANDOM_STATE,
+        )
+
+        # Getting repeated CV scores for the candidate models
         for index, candidate in enumerate(self.candidates):
             if self.verbose:
-                kernel_descr = candidate.model.get_params().get("kernel")
-                print(f"\n   Candidate {candidate.name}: kernel={kernel_descr}")
+                params = candidate.model.get_params()
+                kernel_descr = params.get("kernel", "n/a")
+                print(f"\n   Candidate {candidate.name} ({index + 1}/{n_candidates}): kernel={kernel_descr}")
 
-            candidate.fit(X_train=X_train, y_train=y_train, show_learning_curve=config.SHOW_LEARNING_CURVE)
-            score = float(candidate.model.log_marginal_likelihood_value_)
+            cv_scores = cross_val_score(
+                estimator=candidate.model,
+                X=X_train,
+                y=y_train,
+                cv=cv,
+                scoring="r2",
+                n_jobs=-1,
+            )
+            score = float(np.mean(cv_scores))
+            score_sd = float(np.std(cv_scores))
             scores_abs[index] = score
+            score_std[index] = score_sd
 
             if self.verbose:
-                print(f"              log marginal likelihood={score:.5f}")
+                print(f"              repeated-CV R2 mean={score:.5f}, std={score_sd:.5f}")
+
+        # AI generated visualization tool
+        if self.verbose:
+            ranked_indices = np.argsort(-scores_abs)
+            print("\nRepeated-CV Leaderboard (higher is better)")
+            print("rank | model           | mean_r2   | std_r2")
+            for rank, model_index in enumerate(ranked_indices, start=1):
+                model_name = self.candidates[model_index].name
+                print(
+                    f"{rank:>4} | {model_name:<15} | {scores_abs[model_index]:>8.5f} | {score_std[model_index]:>7.5f}"
+                )
 
         # Model weight generation
         log_evidence = scores_abs
@@ -408,13 +435,23 @@ class BayesianModelSelector(object):
         if self.verbose:
             print(f"\nModel weights (unnormalized): {weights/np.sum(weights)}")
         weights[weights < 1e-4] = 0.0 # Remove very bad models from the list entirely
+
+        if np.sum(weights) == 0.0:
+            weights[np.argmax(scores_abs)] = 1.0
+
         self.weights = weights / np.sum(weights)
+
+        # Train only models with non-zero weights on full training data.
+        for index, candidate in enumerate(self.candidates):
+            if self.weights[index] > 0.0:
+                candidate.fit(X_train=X_train, y_train=y_train, show_learning_curve=config.SHOW_LEARNING_CURVE)
         return
     
     def predict(self, X_test: np.ndarray) -> np.ndarray:
         results = np.zeros([X_test.shape[0],len(self.candidates)])
         for index, candidate in enumerate(self.candidates):
-            results[:, index] = candidate.predict(X_test)
+            if self.weights[index] > 0.0:
+                results[:, index] = candidate.predict(X_test)
         y_pred = np.sum(results * self.weights, axis=1)
         return y_pred
 
@@ -434,6 +471,8 @@ class config:
 
     # Model training
     SHOW_LEARNING_CURVE: bool = True
+    CV_N_SPLITS: int = 5
+    CV_N_REPEATS: int = 3
 
      
 
@@ -462,16 +501,52 @@ def main():
     # Model training and inference
     print("\nBayesian model comparison...")
     candidate_models = [
-        #Model(name = "M0", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + WhiteKernel(noise_level=0.1))),
-        #Model(name = "M1", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
-        #Model(name = "M2", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M3", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1))),
-        #Model(name = "M4", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
-        #Model(name = "M5", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M6", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1))),
-        #Model(name = "M7", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RBF(length_scale=0.5) + WhiteKernel(noise_level=0.1))),
-        #Model(name = "M8", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M9", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
+        Model(
+            name="GP_RQ",
+            model=GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1)),
+                n_restarts_optimizer=5,
+                normalize_y=True,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="GP_Matern25",
+            model=GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1)),
+                n_restarts_optimizer=5,
+                normalize_y=True,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="GP_Mix",
+            model=GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1)),
+                n_restarts_optimizer=5,
+                normalize_y=True,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="HGBR_Basic",
+            model=HistGradientBoostingRegressor(
+                learning_rate=0.05,
+                max_iter=400,
+                max_depth=6,
+                min_samples_leaf=20,
+                l2_regularization=0.1,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="KRR_RBF",
+            model=KernelRidge(
+                kernel="rbf",
+                alpha=1.0,
+                gamma=0.5,
+            ),
+        ),
     ]
     comparator = BayesianModelSelector(candidates=candidate_models, verbose=True)
     comparator.compare_on_train(X_train=X_train, y_train=y_train)
