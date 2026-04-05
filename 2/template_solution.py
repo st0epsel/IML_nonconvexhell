@@ -18,23 +18,6 @@ from sklearn.model_selection import KFold, learning_curve
 import matplotlib.pyplot as plt
 
 
-@dataclass
-class config:
-    DEFAULT_MAX_ITER: int = 10
-    RANDOM_STATE: int = 42
-    OUTPUT_FOLDER_NAME: str = "results"  # Leer lah wenns im gliche Ordner sel gspeicheret werde wie's file isch       
-    BASE_DIR = Path(__file__).resolve().parent
-    OUTPUT_FOLDER = Path(BASE_DIR, OUTPUT_FOLDER_NAME)
-    IMPUTER_INITIAL_STRATEGY = 'median'
-    SHOW_LEARNING_CURVE: bool = True
-
-    # Make sure the output folder exists
-    OUTPUT_FOLDER.mkdir(exist_ok=True)
-    
-
-
-
-
 def v_print(message: Any, verbose: bool = False) -> None:
     if verbose:
         print(message)
@@ -110,7 +93,7 @@ def process_impute_data_global(train_df: pd.DataFrame, test_df: pd.DataFrame, ve
     )
     
     imputer = IterativeImputer(
-        max_iter=config.DEFAULT_MAX_ITER,
+        max_iter=config.IMPUTATION_MAX_ITER,
         estimator=estimator, 
         random_state=config.RANDOM_STATE,
         verbose=2 if verbose else 0,
@@ -156,15 +139,7 @@ def process_impute_data_seasonal(train_df: pd.DataFrame, test_df: pd.DataFrame, 
     X_test: matrix of floats: dim = (100, ?), test input with features
     """
 
-    def model_impute(df: pd.DataFrame, max_iter: int = config.DEFAULT_MAX_ITER, verbose: bool = False) -> pd.DataFrame:
-        """
-        Impute missing values column-by-column using linear regression
-        based on the other columns in df.
-        Assumes all columns in df are numeric.
-        """
-        cols = df.columns
-        idx = df.index
-
+    def fit_imputer(df: pd.DataFrame, max_iter: int = config.IMPUTATION_MAX_ITER, verbose: bool = False) -> IterativeImputer:
         estimator = BayesianRidge(
             compute_score=True,
             fit_intercept=True,
@@ -179,35 +154,71 @@ def process_impute_data_seasonal(train_df: pd.DataFrame, test_df: pd.DataFrame, 
             initial_strategy=config.IMPUTER_INITIAL_STRATEGY,
             imputation_order='ascending'
         )
-        
-        imputed_matrix = imputer.fit_transform(df)
-        return pd.DataFrame(imputed_matrix, columns=cols, index=idx)
 
-    def seasonal_model_impute(df: pd.DataFrame, max_iter: int = config.DEFAULT_MAX_ITER) -> pd.DataFrame:
+        imputer.fit(df)
+        return imputer
+
+    def apply_imputer(df: pd.DataFrame, imputer: IterativeImputer) -> pd.DataFrame:
+        imputed_matrix = imputer.transform(df)
+        return pd.DataFrame(imputed_matrix, columns=df.columns, index=df.index)
+
+    def seasonal_model_impute(
+        train_features_df: pd.DataFrame,
+        test_features_df: pd.DataFrame,
+        max_iter: int = config.IMPUTATION_MAX_ITER
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Perform model-based imputation separately within each season.
-        Expects a column named 'season'.
+        Fit model-based imputers on train data per season and use them to
+        transform both train and test data for that same season.
         """
-        df = df.copy()
-        parts = []
+        train_df_local = train_features_df.copy()
+        test_df_local = test_features_df.copy()
 
-        for season in df["season"].dropna().unique():
-            subset = df[df["season"] == season].copy()
+        train_parts = []
+        test_parts = []
 
-            season_values = subset["season"]
-            numeric_part = subset.drop(columns=["season"])
+        seasons_in_train = train_df_local["season"].dropna().unique()
 
-            numeric_part = model_impute(numeric_part, max_iter=max_iter)
+        for season in seasons_in_train:
+            train_subset = train_df_local[train_df_local["season"] == season].copy()
+            test_subset = test_df_local[test_df_local["season"] == season].copy()
 
-            numeric_part["season"] = season_values
-            parts.append(numeric_part)
+            train_season_values = train_subset["season"]
+            test_season_values = test_subset["season"]
 
-        df_imputed = pd.concat(parts).sort_index()
-        return df_imputed
+            train_numeric = train_subset.drop(columns=["season"])
+            test_numeric = test_subset.drop(columns=["season"])
+
+            imputer = fit_imputer(train_numeric, max_iter=max_iter, verbose=verbose)
+            train_imputed_numeric = apply_imputer(train_numeric, imputer)
+
+            train_imputed_numeric["season"] = train_season_values
+            train_parts.append(train_imputed_numeric)
+
+            if not test_numeric.empty:
+                test_imputed_numeric = apply_imputer(test_numeric, imputer)
+                test_imputed_numeric["season"] = test_season_values
+                test_parts.append(test_imputed_numeric)
+
+        remaining_test = test_df_local.loc[~test_df_local.index.isin(pd.concat(test_parts).index)] if test_parts else test_df_local
+        if not remaining_test.empty:
+            fallback_train_numeric = train_df_local.drop(columns=["season"])
+            fallback_imputer = fit_imputer(fallback_train_numeric, max_iter=max_iter, verbose=verbose)
+            remaining_numeric = remaining_test.drop(columns=["season"])
+            remaining_imputed = apply_imputer(remaining_numeric, fallback_imputer)
+            remaining_imputed["season"] = remaining_test["season"]
+            test_parts.append(remaining_imputed)
+
+        train_imputed = pd.concat(train_parts).sort_index()
+        test_imputed = pd.concat(test_parts).sort_index() if test_parts else test_df_local.copy()
+        return train_imputed, test_imputed
 
     v_print("\nPerforming seasonal model-based imputation...", verbose)
-    X_train_imputed = seasonal_model_impute(train_df.drop(columns=["price_CHF"]), max_iter=config.DEFAULT_MAX_ITER)
-    X_test_imputed = seasonal_model_impute(test_df, max_iter=config.DEFAULT_MAX_ITER)
+    X_train_imputed, X_test_imputed = seasonal_model_impute(
+        train_features_df=train_df.drop(columns=["price_CHF"]),
+        test_features_df=test_df,
+        max_iter=config.IMPUTATION_MAX_ITER
+    )
 
     # combine again, drop empty rows in y
     train_combined = X_train_imputed.copy()
@@ -232,6 +243,49 @@ def process_impute_data_seasonal(train_df: pd.DataFrame, test_df: pd.DataFrame, 
     assert (X_train.shape[1] == X_test.shape[1]) and (X_train.shape[0] == y_train.shape[0]) and (X_test.shape[0] == 100), "Invalid data shape"
     return X_train, y_train, X_test
 
+class Standardizer(object):
+    def __init__(self, ignore_columns: list[str] | None = None) -> None:
+        super().__init__()
+        self.scaler = StandardScaler()
+        self.target_scaler = StandardScaler()
+        self.columns: list[str] = []
+        self.ignore_columns = ignore_columns or []
+        self.scaler_columns: list[str] = []
+        self.target_fitted = False
+
+    def fit(self, X_train: pd.DataFrame) -> None:
+        self.columns = list(X_train.columns)
+        self.scaler_columns = [column for column in self.columns if column not in self.ignore_columns]
+        self.scaler.fit(X_train[self.scaler_columns])
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_scaled = X.copy()
+        X_scaled[self.scaler_columns] = self.scaler.transform(X[self.scaler_columns])
+        return X_scaled
+
+    def fit_target(self, y_train: pd.Series | np.ndarray) -> None:
+        y_array = np.asarray(y_train, dtype=float).reshape(-1, 1)
+        observed_mask = ~np.isnan(y_array).ravel()
+        if not np.any(observed_mask):
+            raise ValueError("Cannot fit target Standardizer without observed labels.")
+        self.target_scaler.fit(y_array[observed_mask].reshape(-1, 1))
+        self.target_fitted = True
+
+    def transform_target(self, y: pd.Series | np.ndarray) -> np.ndarray:
+        if not self.target_fitted:
+            raise ValueError("Target Standardizer must be fitted before transforming labels.")
+        y_array = np.asarray(y, dtype=float).reshape(-1, 1)
+        transformed = y_array.copy()
+        observed_mask = ~np.isnan(y_array).ravel()
+        if np.any(observed_mask):
+            transformed[observed_mask] = self.target_scaler.transform(y_array[observed_mask].reshape(-1, 1))
+        return transformed.ravel()
+
+    def inverse_transform_target(self, y_scaled: np.ndarray) -> np.ndarray:
+        if not self.target_fitted:
+            raise ValueError("Target Standardizer must be fitted before inverse transforming predictions.")
+        y_array = np.asarray(y_scaled, dtype=float).reshape(-1, 1)
+        return self.target_scaler.inverse_transform(y_array).ravel()
 
 class Model(object):
     def __init__(self, kernel, name: str = "Model") -> None:
@@ -252,7 +306,7 @@ class Model(object):
         self._y_train = y_train
         if show_learning_curve:
             filename = f"{self.name}_learning_curve.png"
-            self.create_learning_curve_plot(self.model, X_train, y_train, Path(config.OUTPUT_FOLDER, filename))
+            self._create_learning_curve_plot(X_train, y_train, Path(config.OUTPUT_FOLDER, filename))
             print(f"   Learning curve for {self.name} saved to {Path(config.OUTPUT_FOLDER, filename)}")
         return
 
@@ -263,14 +317,13 @@ class Model(object):
         assert y_pred.shape == (X_test.shape[0],), "Invalid data shape"
         return y_pred
     
-    @staticmethod
-    def create_learning_curve_plot(estimator, X: np.ndarray, y: np.ndarray, output_path: Path) -> None:
+    def _create_learning_curve_plot(self, X: np.ndarray, y: np.ndarray, output_path: Path) -> None:
         """
         Minimal learning curve using CV train/test R2.
         """
         cv = KFold(n_splits=2, shuffle=True, random_state=config.RANDOM_STATE)
         lc_result = learning_curve(
-            estimator=estimator,
+            estimator=self.model,
             X=X,
             y=y,
             cv=cv,
@@ -338,7 +391,8 @@ class BayesianModelSelector(object):
         # Getting log evidence scores for the candidate models
         for index, candidate in enumerate(self.candidates):
             if self.verbose:
-                print(f"\n   Candidate {index}: kernel={candidate.model.kernel_}")
+                kernel_descr = candidate.model.get_params().get("kernel")
+                print(f"\n   Candidate {candidate.name}: kernel={kernel_descr}")
 
             candidate.fit(X_train=X_train, y_train=y_train, show_learning_curve=config.SHOW_LEARNING_CURVE)
             score = float(candidate.model.log_marginal_likelihood_value_)
@@ -346,7 +400,6 @@ class BayesianModelSelector(object):
 
             if self.verbose:
                 print(f"              log marginal likelihood={score:.5f}")
-
 
         # Model weight generation
         log_evidence = scores_abs
@@ -365,46 +418,69 @@ class BayesianModelSelector(object):
         y_pred = np.sum(results * self.weights, axis=1)
         return y_pred
 
-        
+@dataclass
+class config:
+    # System
+    RANDOM_STATE: int = 42
+    OUTPUT_FOLDER_NAME: str = "results"  # Leer lah wenns im gliche Ordner sel gspeicheret werde wie's file isch       
+    BASE_DIR = Path(__file__).resolve().parent
+    OUTPUT_FOLDER = Path(BASE_DIR, OUTPUT_FOLDER_NAME)
+    OUTPUT_FOLDER.mkdir(exist_ok=True)
+
+    # Imputation
+    IMPUTATION_MAX_ITER: int = 50
+    IMPUTER_INITIAL_STRATEGY = 'median'
+    IMPUTER_STRATEGY = 'global' # options 'global' and 'seasonal'
+
+    # Model training
+    SHOW_LEARNING_CURVE: bool = True
+
+     
 
 # Main function. You don't have to change this
-if __name__ == "__main__":
-
+def main():
     # Data loading
     print("\nLoading data...")
     test_df, train_df = load_data(config.BASE_DIR, verbose=False)
 
+    # Data scaling
+    print("\nScaling data...")
+    feature_scaler = Standardizer(ignore_columns=["season"])
+    feature_scaler.fit(train_df.drop(columns=["price_CHF"]))
+
+    target_scaler = Standardizer()
+    target_scaler.fit_target(train_df["price_CHF"])
+
+    train_df_scaled = feature_scaler.transform(train_df.drop(columns=["price_CHF"]))
+    train_df_scaled["price_CHF"] = target_scaler.transform_target(train_df["price_CHF"])
+    test_df_scaled = feature_scaler.transform(test_df)
+
     # Data Preprocessing and Imputation
     print("\nProcessing and imputing data...")
-    X_train, y_train, X_test = process_impute_data_global(train_df, test_df, verbose=False)
-
-    # Data scaling and normalization
-    print("\nScaling data...")
-    scaler = StandardScaler() #scalethe input and test dataset
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    X_train, y_train, X_test = process_impute_data_global(train_df_scaled, test_df_scaled, verbose=False)
 
     # Model training and inference
     print("\nBayesian model comparison...")
     candidate_models = [
-        Model(name = "M0", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + WhiteKernel(noise_level=0.1))),
-        Model(name = "M1", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M2", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M0", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M1", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M2", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1))),
         Model(name = "M3", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M4", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M5", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M4", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M5", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1))),
         Model(name = "M6", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M7", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RBF(length_scale=0.5) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M8", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M7", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RBF(length_scale=0.5) + WhiteKernel(noise_level=0.1))),
+        #Model(name = "M8", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1))),
         Model(name = "M9", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1))),
-        Model(name = "M10", kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=1.0, length_scale=1.0) + WhiteKernel(noise_level=0.1))),
     ]
     comparator = BayesianModelSelector(candidates=candidate_models, verbose=True)
     comparator.compare_on_train(X_train=X_train, y_train=y_train)
     
     # Predicting on test data using the combination of the most suited models for the test data
     print("\nPredicting on test data...")
-    y_pred = comparator.predict(X_test=X_test)
+    y_pred_scaled = comparator.predict(X_test=X_test)
+    y_pred = target_scaler.inverse_transform_target(y_pred_scaled)
+
     # Save results in the required format
     dt = pd.DataFrame(y_pred) 
     dt.columns = ['price_CHF']
@@ -414,3 +490,5 @@ if __name__ == "__main__":
     print("\nResults file successfully generated!")
     
 
+if __name__ == "__main__":
+    main()
