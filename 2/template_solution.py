@@ -2,6 +2,7 @@
 # to first read the whole template and get a sense of the overall structure of the code before trying to fill in any of the TODO gaps
 # First, we import necessary libraries:
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -12,11 +13,12 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, DotProduct, RBF, RationalQuadratic, ConstantKernel
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
-from sklearn.linear_model import BayesianRidge
+from sklearn.linear_model import BayesianRidge, ARDRegression
 from sklearn.gaussian_process.kernels import RationalQuadratic
 from sklearn.model_selection import KFold, RepeatedKFold, learning_curve, cross_val_score
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.kernel_ridge import KernelRidge
+from sklearn.exceptions import ConvergenceWarning
 import matplotlib.pyplot as plt
 
 
@@ -298,7 +300,9 @@ class Model(object):
         self.model = model
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, show_learning_curve: bool = False) -> None:
-        self.model.fit(X_train, y_train)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            self.model.fit(X_train, y_train)
         self._x_train = X_train
         self._y_train = y_train
         if show_learning_curve:
@@ -321,17 +325,19 @@ class Model(object):
         # AI generated visualization tool
 
         cv = KFold(n_splits=2, shuffle=True, random_state=config.RANDOM_STATE)
-        lc_result = learning_curve(
-            estimator=self.model,
-            X=X,
-            y=y,
-            cv=cv,
-            scoring="r2",
-            train_sizes=np.linspace(0.2, 1.0, 100),
-            n_jobs=-1,
-            shuffle=True,
-            random_state=config.RANDOM_STATE,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            lc_result = learning_curve(
+                estimator=self.model,
+                X=X,
+                y=y,
+                cv=cv,
+                scoring="r2",
+                train_sizes=np.linspace(0.2, 1.0, 100),
+                n_jobs=-1,
+                shuffle=True,
+                random_state=config.RANDOM_STATE,
+            )
         train_sizes, train_scores, test_scores = lc_result[:3]
 
         train_mean = np.mean(train_scores, axis=1)
@@ -388,12 +394,6 @@ class BayesianModelSelector(object):
         scores_abs = np.zeros(n_candidates)
         score_std = np.zeros(n_candidates)
 
-        cv = RepeatedKFold(
-            n_splits=config.CV_N_SPLITS,
-            n_repeats=config.CV_N_REPEATS,
-            random_state=config.RANDOM_STATE,
-        )
-
         # Getting repeated CV scores for the candidate models
         for index, candidate in enumerate(self.candidates):
             if self.verbose:
@@ -401,32 +401,25 @@ class BayesianModelSelector(object):
                 kernel_descr = params.get("kernel", "n/a")
                 print(f"\n   Candidate {candidate.name} ({index + 1}/{n_candidates}): kernel={kernel_descr}")
 
-            cv_scores = cross_val_score(
-                estimator=candidate.model,
-                X=X_train,
-                y=y_train,
-                cv=cv,
-                scoring="r2",
-                n_jobs=-1,
-            )
-            score = float(np.mean(cv_scores))
-            score_sd = float(np.std(cv_scores))
+            candidate.fit(X_train=X_train, y_train=y_train, show_learning_curve=config.SHOW_LEARNING_CURVE)
+            
+            # Extract log marginal likelihood (or evidence score) depending on model type
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                if hasattr(candidate.model, 'log_marginal_likelihood_value_'):
+                    # GaussianProcessRegressor
+                    score = float(candidate.model.log_marginal_likelihood_value_)
+                elif hasattr(candidate.model, 'scores_'):
+                    # BayesianRidge, ARDRegression: use last score from convergence trace
+                    score = float(candidate.model.scores_[-1])
+                else:
+                    raise AttributeError(f"Model {candidate.name} does not expose log marginal likelihood or scores.")
+            
             scores_abs[index] = score
-            score_std[index] = score_sd
 
             if self.verbose:
-                print(f"              repeated-CV R2 mean={score:.5f}, std={score_sd:.5f}")
+                print(f"              log marginal likelihood={score:.5f}")
 
-        # AI generated visualization tool
-        if self.verbose:
-            ranked_indices = np.argsort(-scores_abs)
-            print("\nRepeated-CV Leaderboard (higher is better)")
-            print("rank | model           | mean_r2   | std_r2")
-            for rank, model_index in enumerate(ranked_indices, start=1):
-                model_name = self.candidates[model_index].name
-                print(
-                    f"{rank:>4} | {model_name:<15} | {scores_abs[model_index]:>8.5f} | {score_std[model_index]:>7.5f}"
-                )
 
         # Model weight generation
         log_evidence = scores_abs
@@ -435,16 +428,7 @@ class BayesianModelSelector(object):
         if self.verbose:
             print(f"\nModel weights (unnormalized): {weights/np.sum(weights)}")
         weights[weights < 1e-4] = 0.0 # Remove very bad models from the list entirely
-
-        if np.sum(weights) == 0.0:
-            weights[np.argmax(scores_abs)] = 1.0
-
         self.weights = weights / np.sum(weights)
-
-        # Train only models with non-zero weights on full training data.
-        for index, candidate in enumerate(self.candidates):
-            if self.weights[index] > 0.0:
-                candidate.fit(X_train=X_train, y_train=y_train, show_learning_curve=config.SHOW_LEARNING_CURVE)
         return
     
     def predict(self, X_test: np.ndarray) -> np.ndarray:
@@ -500,7 +484,7 @@ def main():
 
     # Model training and inference
     print("\nBayesian model comparison...")
-    candidate_models = [
+    bayesian_candidate_models = [
         Model(
             name="GP_RQ",
             model=GaussianProcessRegressor(
@@ -529,6 +513,23 @@ def main():
             ),
         ),
         Model(
+            name="BayesianRidge",
+            model=BayesianRidge(
+                compute_score=True,
+            ),
+        ),
+        Model(
+            name="ARDRegression",
+            model=ARDRegression(
+                compute_score=True,
+            ),
+        ),
+    ]
+    comparator = BayesianModelSelector(candidates=bayesian_candidate_models, verbose=True)
+    comparator.compare_on_train(X_train=X_train, y_train=y_train)
+
+    other_candidate_models = [
+        Model(
             name="HGBR_Basic",
             model=HistGradientBoostingRegressor(
                 learning_rate=0.05,
@@ -548,8 +549,6 @@ def main():
             ),
         ),
     ]
-    comparator = BayesianModelSelector(candidates=candidate_models, verbose=True)
-    comparator.compare_on_train(X_train=X_train, y_train=y_train)
     
     # Predicting on test data using the combination of the most suited models for the test data
     print("\nPredicting on test data...")
