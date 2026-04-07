@@ -1,24 +1,26 @@
 # This serves as a template which will guide you through the implementation of this task.  It is advised
 # to first read the whole template and get a sense of the overall structure of the code before trying to fill in any of the TODO gaps
 # First, we import necessary libraries:
-from dataclasses import dataclass
 import warnings
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 from sklearn.preprocessing import StandardScaler
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, DotProduct, RBF, RationalQuadratic, ConstantKernel
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
-from sklearn.linear_model import BayesianRidge, ARDRegression
+from sklearn.linear_model import BayesianRidge, ARDRegression, ElasticNet, HuberRegressor, RidgeCV
 from sklearn.gaussian_process.kernels import RationalQuadratic
-from sklearn.model_selection import KFold, RepeatedKFold, learning_curve, cross_val_score
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import KFold, RepeatedKFold, learning_curve, cross_val_score as skl_cross_val_score
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, VotingRegressor, StackingRegressor
 from sklearn.kernel_ridge import KernelRidge
+from sklearn.svm import SVR
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.metrics import r2_score
 import matplotlib.pyplot as plt
 
 
@@ -60,6 +62,7 @@ def load_data(base_dir: Path | None = None, verbose: bool = False) -> tuple[pd.D
     v_print(test_df.head(2), verbose)
 
     return test_df, train_df
+
 
 
 def process_impute_data_global(train_df: pd.DataFrame, test_df: pd.DataFrame, verbose: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -247,6 +250,7 @@ def process_impute_data_seasonal(train_df: pd.DataFrame, test_df: pd.DataFrame, 
     assert (X_train.shape[1] == X_test.shape[1]) and (X_train.shape[0] == y_train.shape[0]) and (X_test.shape[0] == 100), "Invalid data shape"
     return X_train, y_train, X_test
 
+
 class Standardizer(object):
     def __init__(self, ignore_columns: list[str] | None = None) -> None:
         super().__init__()
@@ -266,6 +270,10 @@ class Standardizer(object):
         X_scaled = X.copy()
         X_scaled[self.scaler_columns] = self.scaler.transform(X[self.scaler_columns])
         return X_scaled
+    
+    def fit_transform(self, X_train: pd.DataFrame) -> pd.DataFrame:
+        self.fit(X_train)
+        return self.transform(X_train)
 
     def fit_target(self, y_train: pd.Series | np.ndarray) -> None:
         y_array = np.asarray(y_train, dtype=float).reshape(-1, 1)
@@ -299,13 +307,17 @@ class Model(object):
         self._y_train = None
         self.model = model
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray, show_learning_curve: bool = False) -> None:
+    def fit(
+            self,
+            X_train: np.ndarray, 
+            y_train: np.ndarray
+        ) -> None:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=ConvergenceWarning)
             self.model.fit(X_train, y_train)
         self._x_train = X_train
         self._y_train = y_train
-        if show_learning_curve:
+        if config.SHOW_LEARNING_CURVE:
             filename = f"{self.name}_learning_curve.png"
             self._create_learning_curve_plot(X_train, y_train, Path(config.OUTPUT_FOLDER, filename))
             print(f"   Learning curve for {self.name} saved to {Path(config.OUTPUT_FOLDER, filename)}")
@@ -356,22 +368,17 @@ class Model(object):
         plt.close()
 
 
-class BayesianModelSelector(object):
-
-    def __init__(self, candidates: list[Model], log_priors: np.ndarray | None = None, verbose: bool = False) -> None:
+class BayesianModelCombinator(Model):
+    def __init__(self, candidates: list[Model], name: str | None = None, verbose: bool = False) -> None:
         if candidates == []:
             raise ValueError("No candidate models provided for selection.")
-        if log_priors is not None and len(log_priors) != len(candidates):
-            raise ValueError("Mismatch of log prior and candidate models dimensions.")
-        if log_priors is None:
-            log_priors = np.log(np.array([1.0 / len(candidates)] * len(candidates))) # trivial priors
         
         self.candidates = candidates
-        self.log_priors = log_priors
         self.verbose = verbose
         self.weights = np.zeros(len(candidates))
+        self.name = name if name is not None else "BayesianModelCombinator"
 
-    def compare_on_train(
+    def fit(
         self,
         X_train: np.ndarray,
         y_train: np.ndarray,
@@ -392,29 +399,21 @@ class BayesianModelSelector(object):
         """
         n_candidates = len(self.candidates)
         scores_abs = np.zeros(n_candidates)
-        score_std = np.zeros(n_candidates)
 
         # Getting repeated CV scores for the candidate models
         for index, candidate in enumerate(self.candidates):
             if self.verbose:
                 params = candidate.model.get_params()
                 kernel_descr = params.get("kernel", "n/a")
-                print(f"\n   Candidate {candidate.name} ({index + 1}/{n_candidates}): kernel={kernel_descr}")
+                print(f"   Candidate {candidate.name} ({index + 1}/{n_candidates}): kernel={kernel_descr}")
 
-            candidate.fit(X_train=X_train, y_train=y_train, show_learning_curve=config.SHOW_LEARNING_CURVE)
+            candidate.fit(X_train=X_train, y_train=y_train)
             
             # Extract log marginal likelihood (or evidence score) depending on model type
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=ConvergenceWarning)
-                if hasattr(candidate.model, 'log_marginal_likelihood_value_'):
-                    # GaussianProcessRegressor
-                    score = float(candidate.model.log_marginal_likelihood_value_)
-                elif hasattr(candidate.model, 'scores_'):
-                    # BayesianRidge, ARDRegression: use last score from convergence trace
-                    score = float(candidate.model.scores_[-1])
-                else:
-                    raise AttributeError(f"Model {candidate.name} does not expose log marginal likelihood or scores.")
-            
+                candidate.fit(X_train=X_train, y_train=y_train)
+                score = float(candidate.model.log_marginal_likelihood_value_)
             scores_abs[index] = score
 
             if self.verbose:
@@ -423,12 +422,14 @@ class BayesianModelSelector(object):
 
         # Model weight generation
         log_evidence = scores_abs
-        log_post = log_evidence + self.log_priors 
+        log_post = log_evidence
         weights = np.exp(log_post - np.max(log_post))
-        if self.verbose:
-            print(f"\nModel weights (unnormalized): {weights/np.sum(weights)}")
         weights[weights < 1e-4] = 0.0 # Remove very bad models from the list entirely
         self.weights = weights / np.sum(weights)
+        if self.verbose:
+            print(f"\n   Model weights:")
+            for index, candidate in enumerate(self.candidates):
+                print(f"      {candidate.name}: weight={self.weights[index]:.4f}")
         return
     
     def predict(self, X_test: np.ndarray) -> np.ndarray:
@@ -438,11 +439,31 @@ class BayesianModelSelector(object):
                 results[:, index] = candidate.predict(X_test)
         y_pred = np.sum(results * self.weights, axis=1)
         return y_pred
+    
+
+def repeated_cv_score(model: Model, X_train: np.ndarray, y_train: np.ndarray, verbose: bool = False) -> np.ndarray:
+    cv_strategy = RepeatedKFold(n_splits=config.CV_N_SPLITS, n_repeats=config.CV_N_REPEATS, random_state=config.RANDOM_STATE)
+    scores = []
+    i = 0
+    i_max = config.CV_N_SPLITS * config.CV_N_REPEATS
+    for train_idx, valid_idx in cv_strategy.split(X_train):
+        i += 1
+        v_print(f"\n   CV fold {i}/{i_max}...", verbose)
+        X_tr, X_va = X_train[train_idx], X_train[valid_idx]
+        y_tr, y_va = y_train[train_idx], y_train[valid_idx]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            model.fit(X_tr, y_tr)
+        y_pred = model.predict(X_va)
+        scores.append(r2_score(y_va, y_pred))
+        v_print(f"   CV fold R2 score: {scores[-1]:.5f}", verbose)
+    return np.asarray(scores, dtype=float)
+
 
 @dataclass
 class config:
     # System
-    RANDOM_STATE: int = 42
+    RANDOM_STATE: int = 69
     OUTPUT_FOLDER_NAME: str = "results"  # Leer lah wenns im gliche Ordner sel gspeicheret werde wie's file isch       
     BASE_DIR = Path(__file__).resolve().parent
     OUTPUT_FOLDER = Path(BASE_DIR, OUTPUT_FOLDER_NAME)
@@ -454,11 +475,145 @@ class config:
     IMPUTER_STRATEGY = 'global' # options 'global' and 'seasonal'
 
     # Model training
-    SHOW_LEARNING_CURVE: bool = True
+    SHOW_LEARNING_CURVE: bool = False
+    CV_N_REPEATS: int = 1
     CV_N_SPLITS: int = 5
-    CV_N_REPEATS: int = 3
 
-     
+class model_config:
+
+    BAYESIAN_MODEL_CANDIDATES: list[Model] = [
+        Model(
+            name="GP_RQ",
+            model=GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1)),
+                n_restarts_optimizer=5,
+                normalize_y=True,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="GP_Matern25",
+            model=GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1)),
+                n_restarts_optimizer=5,
+                normalize_y=True,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+    ]
+
+    # Other candidate models for direct prediction without Bayesian model selection
+    OTHER_MODEL_CANDIDATES: list[Model] = [
+        Model(
+            name="RF_Tuned",
+            model=RandomForestRegressor(
+                n_estimators=900,
+                max_depth=None,
+                min_samples_leaf=1,
+                max_features=0.6,
+                bootstrap=True,
+                n_jobs=-1,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="ExtraTrees_Tuned",
+            model=ExtraTreesRegressor(
+                n_estimators=1200,
+                max_depth=None,
+                min_samples_leaf=1,
+                max_features=0.75,
+                n_jobs=-1,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="Voting_TreeKernel",
+            model=VotingRegressor(
+                estimators=[
+                    ("et", ExtraTreesRegressor(n_estimators=900, min_samples_leaf=1, max_features=0.75, n_jobs=-1, random_state=config.RANDOM_STATE)),
+                    ("rf", RandomForestRegressor(n_estimators=700, min_samples_leaf=1, max_features=0.6, n_jobs=-1, random_state=config.RANDOM_STATE)),
+                    ("hgbr", HistGradientBoostingRegressor(learning_rate=0.03, max_iter=700, max_leaf_nodes=63, min_samples_leaf=8, l2_regularization=0.2, random_state=config.RANDOM_STATE)),
+                    ("svr", SVR(kernel="rbf", C=20.0, epsilon=0.03, gamma=0.08)),
+                ],
+            ),
+        ),
+        Model(
+            name="Stacking_TreeKernel",
+            model=StackingRegressor(
+                estimators=[
+                    ("et", ExtraTreesRegressor(n_estimators=700, min_samples_leaf=1, max_features=0.75, n_jobs=-1, random_state=config.RANDOM_STATE)),
+                    ("rf", RandomForestRegressor(n_estimators=500, min_samples_leaf=1, max_features=0.6, n_jobs=-1, random_state=config.RANDOM_STATE)),
+                    ("hgbr", HistGradientBoostingRegressor(learning_rate=0.03, max_iter=600, max_leaf_nodes=63, min_samples_leaf=8, l2_regularization=0.2, random_state=config.RANDOM_STATE)),
+                    ("krr", KernelRidge(kernel="rbf", alpha=0.3, gamma=0.08)),
+                    ("svr", SVR(kernel="rbf", C=20.0, epsilon=0.03, gamma=0.08)),
+                ],
+                final_estimator=RidgeCV(alphas=np.logspace(-3, 2, 15)),
+                passthrough=True,
+                cv=4,
+                n_jobs=-1,
+            ),
+        ),
+    ]
+
+    MODEL_GRAVEYARD: list[Model] = [
+        Model(
+            name="GP_Mix",
+            model=GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1)),
+                n_restarts_optimizer=5,
+                normalize_y=True,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="ARDR",
+            model=ARDRegression(),
+        ),
+        Model(
+            name="GBR_Tuned",
+            model=GradientBoostingRegressor(
+                learning_rate=0.025,
+                n_estimators=800,
+                max_depth=2,
+                min_samples_leaf=5,
+                subsample=0.85,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+        Model(
+            name="KRR_RBF_Tuned",
+            model=KernelRidge(
+                kernel="rbf",
+                alpha=0.3,
+                gamma=0.08,
+            ),
+        ),
+        Model(
+            name="SVR_RBF_Tuned",
+            model=SVR(
+                kernel="rbf",
+                C=25.0,
+                epsilon=0.03,
+                gamma=0.08,
+            ),
+        ),
+        Model(
+            name="HGBR_Tuned",
+            model=HistGradientBoostingRegressor(
+                learning_rate=0.03,
+                max_iter=900,
+                max_leaf_nodes=63,
+                min_samples_leaf=8,
+                l2_regularization=0.2,
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=40,
+                random_state=config.RANDOM_STATE,
+            ),
+        ),
+    ]
+    
 
 # Main function. You don't have to change this
 def main():
@@ -480,83 +635,52 @@ def main():
 
     # Data Preprocessing and Imputation
     print("\nProcessing and imputing data...")
-    X_train, y_train, X_test = process_impute_data_global(train_df_scaled, test_df_scaled, verbose=False)
+    if config.IMPUTER_STRATEGY == 'seasonal':
+        X_train, y_train, X_test = process_impute_data_seasonal(train_df_scaled, test_df_scaled, verbose=False)
+    else:
+        X_train, y_train, X_test = process_impute_data_global(train_df_scaled, test_df_scaled, verbose=False)
 
-    # Model training and inference
-    print("\nBayesian model comparison...")
-    bayesian_candidate_models = [
-        Model(
-            name="GP_RQ",
-            model=GaussianProcessRegressor(
-                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1)),
-                n_restarts_optimizer=5,
-                normalize_y=True,
-                random_state=config.RANDOM_STATE,
-            ),
-        ),
-        Model(
-            name="GP_Matern25",
-            model=GaussianProcessRegressor(
-                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1)),
-                n_restarts_optimizer=5,
-                normalize_y=True,
-                random_state=config.RANDOM_STATE,
-            ),
-        ),
-        Model(
-            name="GP_Mix",
-            model=GaussianProcessRegressor(
-                kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1)),
-                n_restarts_optimizer=5,
-                normalize_y=True,
-                random_state=config.RANDOM_STATE,
-            ),
-        ),
-        Model(
-            name="BayesianRidge",
-            model=BayesianRidge(
-                compute_score=True,
-            ),
-        ),
-        Model(
-            name="ARDRegression",
-            model=ARDRegression(
-                compute_score=True,
-            ),
-        ),
-    ]
-    comparator = BayesianModelSelector(candidates=bayesian_candidate_models, verbose=True)
-    comparator.compare_on_train(X_train=X_train, y_train=y_train)
+    # Model training and scoring
+    comparator = BayesianModelCombinator(candidates=model_config.BAYESIAN_MODEL_CANDIDATES, verbose=True)
+    model_list = model_config.OTHER_MODEL_CANDIDATES + [comparator]
+    leaderboard: list[tuple[float, float, str]] = []
+    # Scoring models
+    print("\nEvaluating candidate models with repeated CV R2...")
+    len_model_list = len(model_list)
+    for i, model in enumerate(model_list):
+        print(f"\nEvaluating model ({i+1}/{len_model_list}): {model.name}")
+        scores = repeated_cv_score(model, X_train, y_train, verbose=True)
+        mean_score = float(scores.mean())
+        std_score = float(scores.std())
+        leaderboard.append((mean_score, std_score, model.name))
+        print(f"   CV R2 scores: {scores}")
+        print(f"   CV R2 mean score: {mean_score:.5f} (std={std_score:.5f})")
 
-    other_candidate_models = [
-        Model(
-            name="HGBR_Basic",
-            model=HistGradientBoostingRegressor(
-                learning_rate=0.05,
-                max_iter=400,
-                max_depth=6,
-                min_samples_leaf=20,
-                l2_regularization=0.1,
-                random_state=config.RANDOM_STATE,
-            ),
-        ),
-        Model(
-            name="KRR_RBF",
-            model=KernelRidge(
-                kernel="rbf",
-                alpha=1.0,
-                gamma=0.5,
-            ),
-        ),
-    ]
+    leaderboard.sort(key=lambda entry: entry[0], reverse=True)
+    print("\nLeaderboard (mean CV R2):")
+    for rank, (mean_score, std_score, model_name) in enumerate(leaderboard, start=1):
+        print(f"   {rank}. {model_name}: {mean_score:.5f} (std={std_score:.5f})")
+
+
+    # Generate weights for voting array based on CV performance
+    scores = np.array([entry[0] for entry in leaderboard])
+    weights = np.minimum(0,0,scores-90**2)
+    weights = weights / np.sum(weights)
+    print("\nModel weights for prediction combination:")
+    for (mean_score, std_score, model_name), weight in zip(leaderboard, weights):
+        print(f"   {model_name}: weight={weight:.4f}")
     
-    # Predicting on test data using the combination of the most suited models for the test data
-    print("\nPredicting on test data...")
-    y_pred_scaled = comparator.predict(X_test=X_test)
-    y_pred = target_scaler.inverse_transform_target(y_pred_scaled)
+    # Generate prediction based on selected models and weights.
+    y_pred_combined = np.zeros(X_test.shape[0])
+    for model in model_list:
+        model.fit(X_train=X_train, y_train=y_train)
+        y_pred_combined += model.predict(X_test) * weights[[entry[2] for entry in leaderboard].index(model.name)]
+
+    # Don't forget to undo the normalization dumbass me
+    y_pred = target_scaler.inverse_transform_target(y_pred_combined)
 
     # Save results in the required format
-    dt = pd.DataFrame(y_pred) 
+    dt = pd.DataFrame(y_pred, columns=['price_CHF']) 
     dt.columns = ['price_CHF']
     out_filename = Path(config.OUTPUT_FOLDER, 'results.csv')
     print(f"Saving results to {out_filename} ...")
