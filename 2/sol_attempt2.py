@@ -87,6 +87,18 @@ class Standardizer(object):
         X_inv_scaled = X_scaled.copy()
         X_inv_scaled[self.scaler_columns] = self.scaler.inverse_transform(X_scaled[self.scaler_columns])
         return X_inv_scaled
+    
+    def invert_column(self, X_scaled: pd.DataFrame, column_name: str) -> np.ndarray:
+        if column_name not in self.scaler_columns:
+            raise ValueError(f"Column '{column_name}' was not scaled and cannot be inverted.")
+        if self.scaler.mean_ is None or self.scaler.scale_ is None:
+            raise ValueError("Scaler statistics are not available. Fit the scaler before inverting.")
+        col_idx = self.scaler_columns.index(column_name)
+        col_mean = self.scaler.mean_[col_idx]
+        col_scale = self.scaler.scale_[col_idx]
+        return (X_scaled[column_name].to_numpy(dtype=float) * col_scale) + col_mean
+        
+        
 
 
 class Model(object):
@@ -134,8 +146,15 @@ class config:
     IMPUTER_INITIAL_STRATEGY = 'median'
 
     # Final model selection
-    ENSEMBLE_TOP_K: int = 3  # Number of top performing models to include in ensemble.
-    ENSEMBLE_WEIGHT_SCALING: int = 4  # Higher values will increase the weight difference between better and worse performing models.
+    ENSEMBLE_TOP_K: int = 4  # Number of top performing models to include in ensemble.
+    ENSEMBLE_WEIGHT_SCALING: int = 5  # Higher values will increase the weight difference between better and worse performing models.
+    ENSEMBLE_USE_MANUAL_WEIGHTS: bool = False  # If True, the weights specified in ENSEMBLE_MANUAL_WEIGHTS will be used instead of the weights calculated based on model performance.
+    ENSEMBLE_MANUAL_WEIGHTS: list[tuple[str, float]] | None = [
+        ("Voting_TreeKernel", 0.4),
+        ("Stacking_TreeKernel", 0.3),
+        ("RidgeCV", 0.15),
+        ("ElasticNetCV", 0.15)
+    ]  # If not None, this list of (model_name, weight) tuples will overwrite the weights calculated based on model performance. This can be used to manually adjust the ensemble weights based on domain knowledge or other considerations beyond just the R2 score.
 
     # Verbosity
     VERBOSE: bool = True
@@ -348,56 +367,125 @@ def main():
     test_df = pd.get_dummies(test_df, columns=['season'], prefix='season')
     train_df = pd.get_dummies(train_df, columns=['season'], prefix='season')
 
-
-    ##################################################################
-    # 1. Model Selection with KFold CV ###############################
-    ##################################################################
-
     # Prepare Imputer estimator (we use a simple model for imputation to save time, since we have to fit an imputer in each fold of the cross-validation)
     estimator = BayesianRidge(
-            compute_score=True,
-            fit_intercept=True,
-            verbose=False
-        )
+        compute_score=True,
+        fit_intercept=True,
+        verbose=False
+    )
 
-    # Prepare folds and model candidates for cross-validation
-    v_print("\nKfold CV preparation...", config.VER_CV)
+    if not config.ENSEMBLE_USE_MANUAL_WEIGHTS:
 
-    models = [model for model in config.MODEL_CANDIDATES if model.name in config.MODELS]
-    model_performance = {model.name: [] for model in models}
+        ##################################################################
+        # 1. Model Selection with KFold CV ###############################
+        ##################################################################
 
-    cv_strategy = RepeatedKFold(n_splits=config.N_CV_SPLITS, n_repeats=config.N_CV_REPEATS, random_state=config.RANDOM_STATE)
+        # Prepare folds and model candidates for cross-validation
+        v_print("\nKfold CV preparation...", config.VER_CV)
 
-    for i, (train_index, validation_index) in enumerate(cv_strategy.split(train_df)):
+        models = [model for model in config.MODEL_CANDIDATES if model.name in config.MODELS]
+        model_performance = {model.name: [] for model in models}
 
-        # Fold Nr. N
-        v_print(f"\nProcessing fold {i+1} / {config.N_CV_SPLITS * config.N_CV_REPEATS} ...", config.VER_CV)
+        cv_strategy = RepeatedKFold(n_splits=config.N_CV_SPLITS, n_repeats=config.N_CV_REPEATS, random_state=config.RANDOM_STATE)
 
-        # Split data into train and validation fold
-        train_fold = train_df.iloc[train_index].reset_index(drop=True)
-        val_fold = train_df.iloc[validation_index].reset_index(drop=True)
+        for i, (train_index, validation_index) in enumerate(cv_strategy.split(train_df)):
 
-        # Keep only rows with observed target for training/evaluation
-        train_fold = train_fold.dropna(subset=["price_CHF"]).reset_index(drop=True)
-        val_fold = val_fold.dropna(subset=["price_CHF"]).reset_index(drop=True)
+            # Fold Nr. N
+            v_print(f"\nProcessing fold {i+1} / {config.N_CV_SPLITS * config.N_CV_REPEATS} ...", config.VER_CV)
 
-        y_train_fold = np.asarray(train_fold["price_CHF"].values, dtype=float)
-        y_val_fold = np.asarray(val_fold["price_CHF"].values, dtype=float)
-        X_train_fold = train_fold.drop(columns=["price_CHF"])
-        X_val_fold = val_fold.drop(columns=["price_CHF"])
+            # Split data into train and validation fold
+            train_fold = train_df.iloc[train_index].reset_index(drop=True)
+            val_fold = train_df.iloc[validation_index].reset_index(drop=True)
 
-        # Scaler (features only)
-        v_print("   Scaling data...", config.VER_PREPROCESSING)
-        scaler = Standardizer(ignore_columns=["season_spring", "season_summer", "season_autumn", "season_winter"])
 
-        train_fold_scaled = scaler.fit_transform(X_train_fold)
-        val_fold_scaled = scaler.transform(X_val_fold)
+            # Remember the indices of rows with empty price_CHF values in validation and testing fold for exclusion of these rows in model training. 
+            train_no_CHF_indices = train_fold[train_fold["price_CHF"].isna()].index
+            val_no_CHF_indices = val_fold[val_fold["price_CHF"].isna()].index
 
-        # Imputer
-        v_print("   Imputing missing values...", config.VER_PREPROCESSING)
-    
+            # Scaler 
+            v_print("   Scaling data...", config.VER_PREPROCESSING)
+            scaler = Standardizer(ignore_columns=["season_spring", "season_summer", "season_autumn", "season_winter"])
+
+            train_fold_scaled = scaler.fit_transform(train_fold)
+            val_fold_scaled = scaler.transform(val_fold)
+
+            # Imputer
+            v_print("   Imputing missing values...", config.VER_PREPROCESSING)
         
-        imputer = IterativeImputer(
+            
+            imputer = IterativeImputer(
+                max_iter=config.IMPUTATION_MAX_ITER,
+                estimator=estimator, 
+                random_state=config.RANDOM_STATE,
+                verbose=0,
+                initial_strategy=config.IMPUTER_INITIAL_STRATEGY,
+                imputation_order='ascending'
+            )
+
+            train_fold_imputed = pd.DataFrame(imputer.fit_transform(train_fold_scaled), columns=train_fold.columns)
+            val_fold_imputed = pd.DataFrame(imputer.transform(val_fold_scaled), columns=val_fold.columns)
+
+            # Drop rows with missing price_CHF values for training and validation fold (these rows will not contribute to model training and evaluation, but we keep them in the fold for consistent imputation and scaling)
+            train_fold_imputed = train_fold_imputed.drop(index=train_no_CHF_indices, errors='ignore').reset_index(drop=True)
+            val_fold_imputed = val_fold_imputed.drop(index=val_no_CHF_indices, errors='ignore').reset_index(drop=True)
+
+            v_print(f"      Training fold:   {train_fold_imputed.shape[0]} rows after dropping missing price_CHF values", config.VERBOSE)
+            v_print(f"      Validation fold: {val_fold_imputed.shape[0]} rows after dropping missing price_CHF values", config.VERBOSE)
+
+            # Train models on fold
+            for model in models:
+                v_print(f"   Training model {model.name}...", config.VER_MODEL_TRAINING)
+                model.fit(train_fold_imputed.drop(columns=["price_CHF"]).values, train_fold_imputed["price_CHF"].values)
+
+                # Evaluate model on validation fold
+                val_predictions = model.predict(val_fold_imputed.drop(columns=["price_CHF"]).values)
+
+                # Calculate R2 score
+                r2 = r2_score(val_fold_imputed["price_CHF"], val_predictions)
+                v_print(f"      R2 score on validation fold: {r2:.4f}", config.VER_MODEL_EVALUATION)
+
+                # Store model performance for this fold
+                model_performance[model.name].append(r2)
+
+        
+
+        v_print("\nModel evaluation and selection after cross-validation...", config.VER_MODEL_EVALUATION)
+
+        # Model evaluation and selection after cross-validation
+        eval_df = pd.DataFrame()
+        eval_df["model"] = list(model_performance.keys())
+        eval_df["r2_score"] = np.mean(list(model_performance.values()), axis=1)
+        eval_df["rank"] = eval_df["r2_score"].rank(ascending=False)
+        eval_df["weight"] = np.exp(config.ENSEMBLE_WEIGHT_SCALING * eval_df["r2_score"]) / np.sum(np.exp(config.ENSEMBLE_WEIGHT_SCALING * eval_df["r2_score"]))
+        eval_df["weight"] = np.where(eval_df["rank"] > config.ENSEMBLE_TOP_K, 0.0, eval_df["weight"])
+        # Normalize weights again after dropping models that are not in the ensemble
+        eval_df["weight"] = eval_df["weight"] / eval_df["weight"].sum()
+
+        voting_estimators = [(model.name, model.model) for model in models if model.name in eval_df[eval_df["weight"] > 0]["model"].values]
+        final_model = VotingRegressor(estimators=voting_estimators, weights=eval_df.set_index("model").loc[[name for name, weight in voting_estimators], "weight"].values, n_jobs=-1)
+        if config.VER_MODEL_EVALUATION:
+            print("\nModel performance summary after cross-validation:")
+            print(eval_df.sort_values("r2_score", ascending=False).reset_index(drop=True))
+    
+    else:
+        # If manual ensemble weights are used, we skip the model selection step and directly prepare the final ensemble model with the specified weights.
+        voting_estimators = [(model.name, model.model) for model in config.MODEL_CANDIDATES if model.name in dict(config.ENSEMBLE_MANUAL_WEIGHTS)]
+        final_model = VotingRegressor(estimators=voting_estimators, weights=np.array([weight for name, weight in config.ENSEMBLE_MANUAL_WEIGHTS if name in dict(voting_estimators)]), n_jobs=-1)
+
+
+
+    ##################################################################
+    # 2. FinalModel training (Voting Array) ##########################
+    ##################################################################
+    
+    
+    # Prepare final training data
+    v_print("Prepearing final training data with scaling and imputation...", config.VER_FINAL_TRAINING)
+    train_no_CHF_indices = train_df[train_df["price_CHF"].isna()].index
+
+    scaler_final = Standardizer(ignore_columns=["season_spring", "season_summer", "season_autumn", "season_winter"])
+    train_scaled = scaler_final.fit_transform(train_df)
+    imputer_final = IterativeImputer(
             max_iter=config.IMPUTATION_MAX_ITER,
             estimator=estimator, 
             random_state=config.RANDOM_STATE,
@@ -405,89 +493,26 @@ def main():
             initial_strategy=config.IMPUTER_INITIAL_STRATEGY,
             imputation_order='ascending'
         )
+    train_imputed = pd.DataFrame(imputer_final.fit_transform(train_scaled), columns=train_df.columns)
 
-        train_fold_imputed = pd.DataFrame(imputer.fit_transform(train_fold_scaled), columns=X_train_fold.columns)
-        val_fold_imputed = pd.DataFrame(imputer.transform(val_fold_scaled), columns=X_val_fold.columns)
-
-        v_print(f"      Training fold:   {train_fold_imputed.shape[0]} rows after dropping missing price_CHF values", config.VERBOSE)
-        v_print(f"      Validation fold: {val_fold_imputed.shape[0]} rows after dropping missing price_CHF values", config.VERBOSE)
-
-        # Train models on fold
-        for model in models:
-            v_print(f"   Training model {model.name}...", config.VER_MODEL_TRAINING)
-            model.fit(train_fold_imputed.values, y_train_fold)
-
-            # Evaluate model on validation fold
-            val_predictions = model.predict(val_fold_imputed.values)
-
-            # Calculate R2 score
-            r2 = r2_score(y_val_fold, val_predictions)
-            v_print(f"      R2 score on validation fold: {r2:.4f}", config.VER_MODEL_EVALUATION)
-
-            # Store model performance for this fold
-            model_performance[model.name].append(r2)
-
-    ##################################################################
-    # 2. FinalModel training (Voting Array) ##########################
-    ##################################################################
-
-    v_print("\nModel evaluation and selection after cross-validation...", config.VER_MODEL_EVALUATION)
-
-    # Model evaluation and selection after cross-validation
-    eval_df = pd.DataFrame()
-    eval_df["model"] = list(model_performance.keys())
-    eval_df["r2_score"] = np.mean(list(model_performance.values()), axis=1)
-    eval_df["rank"] = eval_df["r2_score"].rank(ascending=False)
-    eval_df["weight"] = np.exp(config.ENSEMBLE_WEIGHT_SCALING * eval_df["r2_score"]) / np.sum(np.exp(config.ENSEMBLE_WEIGHT_SCALING * eval_df["r2_score"]))
-    eval_df["weight"] = np.where(eval_df["rank"] > config.ENSEMBLE_TOP_K, 0.0, eval_df["weight"])
-    # Normalize weights again after dropping models that are not in the ensemble
-    eval_df["weight"] = eval_df["weight"] / eval_df["weight"].sum()
-
-    voting_estimators = [(model.name, model.model) for model in models if model.name in eval_df[eval_df["weight"] > 0]["model"].values]
-    ensemble_weights = np.asarray(
-        eval_df.set_index("model").loc[[name for name, _ in voting_estimators], "weight"].values,
-        dtype=float
-    )
-    final_model = VotingRegressor(estimators=voting_estimators, weights=ensemble_weights, n_jobs=-1)
-    if config.VER_MODEL_EVALUATION:
-        print("\nModel performance summary after cross-validation:")
-        print(eval_df.sort_values("r2_score", ascending=False).reset_index(drop=True))
-    
-    
-    # Prepare final training data
-    v_print("Prepearing final training data with scaling and imputation...", config.VER_FINAL_TRAINING)
-    train_supervised = train_df.dropna(subset=["price_CHF"]).reset_index(drop=True)
-    X_train_final = train_supervised.drop(columns=["price_CHF"])
-    y_train_final = np.asarray(train_supervised["price_CHF"].values, dtype=float)
-
-    scaler_final = Standardizer(ignore_columns=["season_spring", "season_summer", "season_autumn", "season_winter"])
-    train_scaled = scaler_final.fit_transform(X_train_final)
-    final_estimator = BayesianRidge(
-        compute_score=True,
-        fit_intercept=True,
-        verbose=False
-    )
-    imputer_final = IterativeImputer(
-            max_iter=config.IMPUTATION_MAX_ITER,
-            estimator=final_estimator,
-            random_state=config.RANDOM_STATE,
-            verbose=0,
-            initial_strategy=config.IMPUTER_INITIAL_STRATEGY,
-            imputation_order='ascending'
-        )
-    train_imputed = pd.DataFrame(imputer_final.fit_transform(train_scaled), columns=X_train_final.columns)
+    # Delete rows with missing price_CHF values from training data
+    train_imputed = train_imputed.drop(index=train_no_CHF_indices)
 
     # Fit model on entire training data
     v_print("Training final model on entire training data...", config.VER_FINAL_TRAINING)
-    final_model.fit(train_imputed.values, y_train_final)
+    final_model.fit(train_imputed.drop(columns=["price_CHF"]).values, train_imputed["price_CHF"].values)
 
-    # Prepare test features
-    test_df = test_df.reindex(columns=X_train_final.columns)
+    # Prepare test data and sanity_check data (training data)
+    test_df["price_CHF"] = np.nan  # Add empty price_CHF column to test data for consistent imputation and scaling
+    test_df = test_df.reindex(columns=train_df.columns)
     test_scaled = scaler_final.transform(test_df)
-    test_imputed = pd.DataFrame(imputer_final.transform(test_scaled), columns=X_train_final.columns)
+    test_imputed = pd.DataFrame(imputer_final.transform(test_scaled), columns=train_df.columns)
 
     # Predict on test data
-    y_pred = final_model.predict(test_imputed.values)
+    y_pred_scaled = final_model.predict(test_imputed.drop(columns=["price_CHF"]).values)
+
+    # reverse scaling
+    y_pred = scaler_final.invert_column(pd.DataFrame(y_pred_scaled, columns=["price_CHF"]), "price_CHF").flatten()
 
     # Save results in the required format
     dt = pd.DataFrame(y_pred, columns=['price_CHF']) 
