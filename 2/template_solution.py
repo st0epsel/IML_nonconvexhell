@@ -93,10 +93,16 @@ def process_impute_data_global(train_df: pd.DataFrame, test_df: pd.DataFrame, ve
     X_test_df = X_test_df.reindex(columns=X_train_df.columns, fill_value=0)
 
     # Use the same imputer for both test and training data but only use training data to fit the imputer.
-    estimator = BayesianRidge(
-        compute_score=True,
-        fit_intercept=True,
-        verbose=verbose
+    
+    #estimator = BayesianRidge(
+    #   compute_score=True,
+    #    fit_intercept=True,
+    #    verbose=verbose
+    #)
+    estimator = ExtraTreesRegressor(
+        n_estimators=50, 
+        random_state=config.RANDOM_STATE,
+        n_jobs=-1
     )
     
     imputer = IterativeImputer(
@@ -147,10 +153,15 @@ def process_impute_data_seasonal(train_df: pd.DataFrame, test_df: pd.DataFrame, 
     """
 
     def fit_imputer(df: pd.DataFrame, max_iter: int = config.IMPUTATION_MAX_ITER, verbose: bool = False) -> IterativeImputer:
-        estimator = BayesianRidge(
+        '''estimator = BayesianRidge(
             compute_score=True,
             fit_intercept=True,
             verbose=verbose
+        )'''
+        estimator = ExtraTreesRegressor(
+            n_estimators=50, 
+            random_state=config.RANDOM_STATE,
+            n_jobs=-1
         )
         
         imputer = IterativeImputer(
@@ -487,7 +498,7 @@ class model_config:
             model=GaussianProcessRegressor(
                 kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (RationalQuadratic(alpha=0.564, length_scale=0.309) + WhiteKernel(noise_level=0.1)),
                 n_restarts_optimizer=5,
-                normalize_y=True,
+                normalize_y=False,
                 random_state=config.RANDOM_STATE,
             ),
         ),
@@ -496,7 +507,7 @@ class model_config:
             model=GaussianProcessRegressor(
                 kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (Matern(length_scale=1.0, nu=2.5) + WhiteKernel(noise_level=0.1)),
                 n_restarts_optimizer=5,
-                normalize_y=True,
+                normalize_y=False,
                 random_state=config.RANDOM_STATE,
             ),
         ),
@@ -554,6 +565,16 @@ class model_config:
                 n_jobs=-1,
             ),
         ),
+
+        Model(
+            name="GP_DotProduct_Matern",
+            model=GaussianProcessRegressor(
+            kernel=ConstantKernel(1.0) * DotProduct(sigma_0=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1),
+            n_restarts_optimizer=5,
+            normalize_y=False, # Remember to keep this False!
+            random_state=config.RANDOM_STATE,
+    ),
+),
     ]
 
     MODEL_GRAVEYARD: list[Model] = [
@@ -562,7 +583,7 @@ class model_config:
             model=GaussianProcessRegressor(
                 kernel=ConstantKernel(1.0, (1e-3, 1e3)) * (DotProduct() + RBF(length_scale=1.0) + Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1)),
                 n_restarts_optimizer=5,
-                normalize_y=True,
+                normalize_y=False,
                 random_state=config.RANDOM_STATE,
             ),
         ),
@@ -663,9 +684,13 @@ def main():
 
 
     # Generate weights for voting array based on CV performance
-    scores = np.array([entry[0] for entry in leaderboard])
-    weights = np.minimum(0,0,scores-90**2)
-    weights = weights / np.sum(weights)
+    scores = np.array([entry[0] for entry in leaderboard99999])
+    weights = np.maximum(0.0,scores)
+    if np.sum(weights) > 0:
+        weights = weights / np.sum(weights) # Normalize to sum to 1
+    else:
+        weights = np.ones_like(scores) / len(scores) # Fallback to equal weighting
+
     print("\nModel weights for prediction combination:")
     for (mean_score, std_score, model_name), weight in zip(leaderboard, weights):
         print(f"   {model_name}: weight={weight:.4f}")
