@@ -147,19 +147,19 @@ class config:
     ENSEMBLE_WEIGHT_SCALING: int = 5  # Higher values will increase the weight difference between better and worse performing models.
     ENSEMBLE_USE_MANUAL_WEIGHTS: bool = True  # If True, the weights specified in ENSEMBLE_MANUAL_WEIGHTS will be used instead of the weights calculated based on model performance.
     ENSEMBLE_MANUAL_WEIGHTS: list[tuple[str, float]] | None = [
-        ("RF", 0.0660298842159948),
-        ("ExtraTrees", 0.0711377775293724),
+        #("RF", 0.0660298842159948),
+        #("ExtraTrees", 0.0711377775293724),
         ("Voting_TreeKernel", 0.07565146292024437),
         ("Stacking_TreeKernel", 0.10832804133412499),
         ("RidgeCV", 0.11214108833478026),
-        ("ElasticNetCV", 0.0782937774068802),
-        ("HGBR_Baseline", 0.06055213592281012),
-        ("GP_Mix", 0.10934891877496583),
-        ("ARDR", 0.07215046712007794),
-        ("GBR_Tuned", 0.05747804803469602),
-        ("KRR_RBF_Tuned", 0.046848491567301996),
-        ("SVR_RBF_Tuned", 0.08417436951212214),
-        ("HGBR_Tuned", 0.057865537326629),
+        #("ElasticNetCV", 0.0782937774068802),
+        #("HGBR_Baseline", 0.06055213592281012),
+        #("GP_Mix", 0.10934891877496583),
+        #("ARDR", 0.07215046712007794),
+        #("GBR_Tuned", 0.05747804803469602),
+        #("KRR_RBF_Tuned", 0.046848491567301996),
+        #("SVR_RBF_Tuned", 0.08417436951212214),
+        #("HGBR_Tuned", 0.057865537326629),
     ]  # If not None, this list of (model_name, weight) tuples will overwrite the weights calculated based on model performance. This can be used to manually adjust the ensemble weights based on domain knowledge or other considerations beyond just the R2 score.
 
     # Verbosity
@@ -351,7 +351,6 @@ def main():
     Basis:
     - each fold gets its own scaler
     - each fold gets its own imputer
-    - each fold gets its own one-hot encoding alignment
     - each fold gets its own trained model(s)
     """
 
@@ -482,23 +481,24 @@ def main():
         final_model = VotingRegressor(estimators=voting_estimators, weights=np.array([weight for name, weight in config.ENSEMBLE_MANUAL_WEIGHTS if name in dict(voting_estimators)]), n_jobs=-1)
 
     ##################################################################
-    # 2. FinalModel training (Voting Array) ##########################
+    # 2. Final Model training (Voting Array) #########################
     ##################################################################
     
     # Prepare final training data
     v_print("Prepearing final training data with scaling and imputation...", config.VER_FINAL_TRAINING)
     train_no_CHF_indices = train_df[train_df["price_CHF"].isna()].index
 
-    scaler_final = Standardizer(ignore_columns=["season_spring", "season_summer", "season_autumn", "season_winter"])
-    train_scaled = scaler_final.fit_transform(train_df)
+    # Scaling source and target training and testing data.
+    f_scaler_source = Standardizer(ignore_columns=["price_CHF","season_spring", "season_summer", "season_autumn", "season_winter"])
+    f_scaler_target = Standardizer(ignore_columns=[col for col in train_df.columns if col != "price_CHF"])
 
-    Xf_train_scaled = train_scaled.drop(columns=["price_CHF"])
-    yf_train_scaled = pd.DataFrame(train_scaled["price_CHF"])
-    test_df["price_CHF"] = np.nan  # Add empty price_CHF column to test data for consistent imputation and scaling
-    Xf_test_scaled = scaler_final.transform(test_df)
-    Xf_test_scaled = Xf_test_scaled.drop(columns=["price_CHF"])
-    print(Xf_test_scaled.head())
+    Xf_train_scaled = f_scaler_source.fit_transform(train_df)
+    yf_train_scaled = f_scaler_target.fit_transform(train_df)
+    Xf_test_scaled = f_scaler_source.transform(test_df) 
 
+    #print(f" scaled data: \n{Xf_train_scaled.head(2)} \n{yf_train_scaled.head(2)} \n{Xf_test_scaled.head(2)}")  
+
+    # Imputing missin data in training and test data with imputer fitted on training data
     imputer_final = IterativeImputer(
             max_iter=config.IMPUTATION_MAX_ITER,
             estimator=estimator, 
@@ -508,12 +508,15 @@ def main():
             imputation_order='ascending'
         )
     
-    Xf_train_scaled_imputed = pd.DataFrame(imputer_final.fit_transform(Xf_train_scaled))
-    Xf_test_scaled_imputed = pd.DataFrame(imputer_final.transform(Xf_test_scaled))
+    Xf_train_scaled_imputed = pd.DataFrame(imputer_final.fit_transform(Xf_train_scaled.drop(columns=["price_CHF"])), columns=Xf_train_scaled.drop(columns=["price_CHF"]).columns)
+    Xf_test_scaled_imputed = pd.DataFrame(imputer_final.transform(Xf_test_scaled), columns=Xf_test_scaled.columns)
+
+    print(f"\n imputed data: \n{Xf_train_scaled_imputed.head(5)} \n{Xf_test_scaled_imputed.head(5)}")
+    print(f"\n training data y: \n{yf_train_scaled.head(5)}")
 
     # Delete rows with missing price_CHF values from training data
-    Xf_train_scaled_imputed = Xf_train_scaled_imputed.drop(index=train_no_CHF_indices)
-    yf_train_scaled= yf_train_scaled.drop(index=train_no_CHF_indices)
+    Xf_train_scaled_imputed.drop(index=train_no_CHF_indices, inplace=True)
+    yf_train_scaled.drop(index=train_no_CHF_indices, inplace=True)
 
     # Fit model on entire training data
     v_print("Training final model on entire training data...", config.VER_FINAL_TRAINING)
@@ -522,10 +525,8 @@ def main():
     # Predict on test data
     y_pred_scaled = pd.DataFrame(final_model.predict(Xf_test_scaled_imputed.values), columns=["price_CHF"])
 
-    # inverse scaling
-    Xf_test_scaled_with_pred = Xf_test_scaled_imputed.copy()
-    Xf_test_scaled_with_pred["price_CHF"] = y_pred_scaled["price_CHF"]
-    y_pred = scaler_final.inverse_transform(Xf_test_scaled_with_pred, columns=["price_CHF"])["price_CHF"]
+    # inverse prediction scaling
+    y_pred = f_scaler_target.inverse_transform(y_pred_scaled)
 
     #print(f"\n test_imputed_with_pred:\n{test_imputed_with_pred.head()}")
     #print(f"\n test_imputed with pred inverted head:\n{test_imputed_with_pred_inverted.head()}")
