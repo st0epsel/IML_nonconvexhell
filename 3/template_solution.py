@@ -58,13 +58,13 @@ def load_data(**kwargs):
     train_data = np.load("train_data.npz")["data"]
 
     # Make the training data a tensor
-    train_data = torch.tensor(train_data, dtype=torch.float32)
+    train_data = torch.tensor(train_data, dtype=torch.float32) #/255.0
 
     # Load the test data
     test_data_input = np.load("test_data.npz")["data"]
 
     # Make the test data a tensor
-    test_data_input = torch.tensor(test_data_input, dtype=torch.float32)
+    test_data_input = torch.tensor(test_data_input, dtype=torch.float32) #/255.0
 
     ########################################
     # TODO: Given the original training images, create the input images and the
@@ -137,7 +137,7 @@ def training(train_data_input, train_data_label, **kwargs):
     # changed
     n_epochs =15
 
-    for epoch in range(n_epochs):
+    for epoch in range(n_epochs): #next step: maybe add break if epoch doesnt yield too much benefit
         i = 0
         lossval = 0
         for x, y in tqdm(
@@ -168,14 +168,26 @@ class Model(nn.Module):
         """
         The constructor of the model.
         """
-        super().__init__() #using a neural network
-        self.enc1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+       
+        super().__init__() 
+        self.enc1 = nn.Conv2d(1, 32, kernel_size=3, padding=1) #neural network with...
+        self.bn1 = nn.BatchNorm2d(32) #batch normalization 
+        
         self.enc2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2)
+        self.bn2 = nn.BatchNorm2d(64) 
+        
         self.enc3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2)
+        self.bn3 = nn.BatchNorm2d(128) 
+        
         self.enc4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)          
+        self.bn4 = nn.BatchNorm2d(128)
 
         self.dec1 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
+        self.bn5 = nn.BatchNorm2d(128)
+        
         self.dec2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.bn6 = nn.BatchNorm2d(64)
+        
         self.out_layer = nn.Conv2d(64, 1, kernel_size=3, padding=1)
 
     def forward(self, x):
@@ -188,17 +200,19 @@ class Model(nn.Module):
         """
         x = x.view(-1, 1, 28, 28)
         x = x / 255.0
+        x = F.relu(self.bn1(self.enc1(x))) #thsi is where the program runs the model
+        x = F.relu(self.bn2(self.enc2(x)))
+        x = F.relu(self.bn3(self.enc3(x)))
+        x = F.relu(self.bn4(self.enc4(x)))
         
-        x = F.relu(self.enc1(x))
-        x = F.relu(self.enc2(x))
-        x = F.relu(self.enc3(x))
-        x = F.relu(self.enc4(x))
-        
-        x = F.relu(self.dec1(x))
-        x = F.relu(self.dec2(x))
+        x = F.relu(self.bn5(self.dec1(x)))
+        x = F.relu(self.bn6(self.dec2(x)))
         
         x = torch.sigmoid(self.out_layer(x))
-        return x * 255.0
+
+        x = x * 255.0
+
+        return x
 
 
 def testing(model, test_data_input):
@@ -229,6 +243,7 @@ def testing(model, test_data_input):
             desc="Predicting test output",
         ):
             output = model(test_data_input[i : i + batch_size])
+            #output = output * 255.0
             test_data_output.append(output.cpu())
         test_data_output = torch.cat(test_data_output)
 
