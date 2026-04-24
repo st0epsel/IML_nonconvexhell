@@ -73,6 +73,7 @@ def load_data(**kwargs):
     # training data) with your own implementation.
     train_data_label = train_data.clone()
     train_data_input = train_data.clone()
+    train_data_input[..., 10:18, 10:18] = 0 #setting the middle of the training data to black
 
     # Visualize the training data if needed
     # Set to False if you don't want to save the images
@@ -114,40 +115,44 @@ def training(train_data_input, train_data_label, **kwargs):
 
     # TODO: Dummy criterion - change this to the correct loss function
     # https://pytorch.org/docs/stable/nn.html#loss-functions
-    criterion = lambda x, y: torch.mean((x))
+    criterion = nn.MSELoss() #use minimum square error loss
     # TODO: Dummy optimizer - change this to a more suitable optimizer
-    optimizer = torch.optim.SGD(model.parameters())
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001) #change lr (learning rate) as parameter
 
     # TODO: Correctly setup the dataloader - the below is just a placeholder
     # Also consider that you might not want to use the entire dataset for
     # training alone
     # (batch_size needs to be changed)
-    batch_size = 1
-    dataset = TensorDataset(train_data_input, train_data_label)
+    batch_size = 64
+    dataset = TensorDataset(train_data_input, train_data_label) #load data and labels
     # Consider the shuffle parameter and other parameters of the DataLoader
     # class (see
     # https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader)
-    data_loader = DataLoader(dataset, batch_size=batch_size)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Training loop
     # TODO: Modify the training loop in case you need to
 
     # TODO: The value of n_epochs is just a placeholder and likely needs to be
     # changed
-    n_epochs = 1
+    n_epochs =15
 
     for epoch in range(n_epochs):
+        i = 0
+        lossval = 0
         for x, y in tqdm(
             data_loader, desc=f"Training Epoch {epoch}", leave=False
         ):
+            i += 1
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             output = model(x)
             loss = criterion(output, y)
             loss.backward()
             optimizer.step()
+            lossval += loss.item()
 
-        print(f"Epoch {epoch} loss: {loss.item()}")
+        print(f"Epoch {epoch} loss: {lossval/i}")
 
     return model
 
@@ -163,8 +168,15 @@ class Model(nn.Module):
         """
         The constructor of the model.
         """
-        super().__init__()
-        self.fc = nn.Linear(784, 784)
+        super().__init__() #using a neural network
+        self.enc1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.enc2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2)
+        self.enc3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2)
+        self.enc4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)          
+
+        self.dec1 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
+        self.dec2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.out_layer = nn.Conv2d(64, 1, kernel_size=3, padding=1)
 
     def forward(self, x):
         """
@@ -174,13 +186,19 @@ class Model(nn.Module):
 
         output: x: torch.Tensor, the output of the model
         """
-        # Flatten the image in the last two dimensions
-        x = x.view(x.shape[0], -1)
-        x = self.fc(x)
-        x = F.relu(x)
-        # Reshape the image to the original shape
-        x = x.view(x.shape[0], 1, 28, 28)
-        return x
+        x = x.view(-1, 1, 28, 28)
+        x = x / 255.0
+        
+        x = F.relu(self.enc1(x))
+        x = F.relu(self.enc2(x))
+        x = F.relu(self.enc3(x))
+        x = F.relu(self.enc4(x))
+        
+        x = F.relu(self.dec1(x))
+        x = F.relu(self.dec2(x))
+        
+        x = torch.sigmoid(self.out_layer(x))
+        return x * 255.0
 
 
 def testing(model, test_data_input):
